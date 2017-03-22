@@ -27,9 +27,11 @@
 MODULE_LICENSE("GPL");
 
 
+//mybrd 드라이버 관리 데이터
 struct mybrd_device {
 	struct request_queue *mybrd_queue;
 	struct gendisk *mybrd_disk;
+	//동기화
 	spinlock_t mybrd_lock;
 };
 
@@ -179,11 +181,14 @@ static int __init mybrd_init(void)
 {
 	pr_warn("\n\n\nmybrd: module loaded\n\n\n\n");
 
+	//장치 번호 반환
 	mybrd_major = register_blkdev(mybrd_major, "my-ramdisk");
 	if (mybrd_major < 0)
 		return mybrd_major;
 
 	pr_warn("mybrd major=%d\n", mybrd_major);
+
+	//mybrd_device 객체(request_queue, gendisk) 생성
 	global_mybrd = mybrd_alloc();
 	if (!global_mybrd) {
 		pr_warn("failed to initialize mybrd\n");
