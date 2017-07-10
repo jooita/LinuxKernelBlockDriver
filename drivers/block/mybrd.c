@@ -35,6 +35,7 @@ struct mybrd_device {
 	struct request_queue *mybrd_queue;
 	struct gendisk *mybrd_disk;
 	spinlock_t mybrd_lock;
+	// page handling in kernel
 	struct radix_tree_root mybrd_pages;
 };
 
@@ -44,15 +45,21 @@ struct mybrd_device *global_mybrd;
 #define MYBRD_SIZE_4M 4*1024*1024
 
 
+//tree 에서 특정 섹터의 데이터를 가지고 있는 페이지를 찾는 함수( 입력- 섹터 번호, 반환- 페이지)
 static struct page *mybrd_lookup_page(struct mybrd_device *mybrd,
 				      sector_t sector)
 {
 	pgoff_t idx;
 	struct page *p;
 
+	// tree에서 페이지를 찾는 동안 read lock()
 	rcu_read_lock();
 
+	//섹터 번호를 가지고 key 값 만들기
+	// 1 page = 4096 byte, 1 sector = 512 byte, 1 page = 8 sectors
+	// 페이지에 저장되는 최초의 섹터번호를 키 값으로 정함 (섹터번호*512/4096)
 	idx = sector >> (PAGE_SHIFT - 9);
+	// 특정 키로 페이지 찾기
 	p = radix_tree_lookup(&mybrd->mybrd_pages, idx);
 
 	rcu_read_unlock();
@@ -62,6 +69,7 @@ static struct page *mybrd_lookup_page(struct mybrd_device *mybrd,
 	return p;
 }
 
+// tree에 페이지 추가
 static struct page *mybrd_insert_page(struct mybrd_device *mybrd,
 				      sector_t sector)
 {
@@ -69,16 +77,19 @@ static struct page *mybrd_insert_page(struct mybrd_device *mybrd,
 	struct page *p;
 	gfp_t gfp_flags;
 
+	// 해당 섹터가 tree에 있는지 확인
 	p = mybrd_lookup_page(mybrd, sector);
 	if (p)
 		return p;
 
 	// MUST use _NOIO
+	// GFP_NOIO : block i/o 코드에서 메모리 회수가 필요할때 사용. 디스크 io 수행 x
 	gfp_flags = GFP_NOIO | __GFP_ZERO;
 	p = alloc_page(gfp_flags);
 	if (!p)
 		return NULL;
 
+	//사전에 tree node 할당
 	if (radix_tree_preload(GFP_NOIO)) {
 		__free_page(p);
 		return NULL;
@@ -91,11 +102,15 @@ static struct page *mybrd_insert_page(struct mybrd_device *mybrd,
 	 */
 	spin_lock(&mybrd->mybrd_lock);
 
+	//섹터 번호로 키 값 구함
+	// (sector / 8)
 	idx = sector >> (PAGE_SHIFT - 9);
 	p->index = idx;
 
+	// radix tree에 페이지 넣기 : root 포인터, key 값(섹터 번호), 페이지 포인터 필요.
 	if (radix_tree_insert(&mybrd->mybrd_pages, idx, p)) {
 		__free_page(p);
+		//tree의 특정 키를 사용하여 페이지 찾기
 		p = radix_tree_lookup(&mybrd->mybrd_pages, idx);
 		pr_warn("failed to insert page: duplicated=%d\n",
 			(int)idx);
@@ -118,14 +133,16 @@ static void show_data(unsigned char *ptr)
 		ptr[4],	ptr[5],	ptr[6], ptr[7]);
 }
 
+//사용자로부터 커널을 통해 전달된 데이터를 램디스크에 쓰는 함수
 static int copy_from_user_to_mybrd(struct mybrd_device *mybrd,
-			 struct page *src_page,
-			 int len,
-			 unsigned int src_offset,
-			 sector_t sector)
+			 struct page *src_page, //데이터가 저장된 페이지
+			 int len, // 데이터 크기
+			 unsigned int src_offset, // 페이지 내의 데이터 시작 offset
+			 sector_t sector) // 커널이 요청한 섹터 번호
 {
-	struct page *dst_page;
+	struct page *dst_page; 
 	void *dst;
+	//요청된 섹터 위치
 	unsigned int target_offset;
 	size_t copy;
 	void *src;
@@ -140,15 +157,23 @@ static int copy_from_user_to_mybrd(struct mybrd_device *mybrd,
 	// store 512*3-bytes at page2 (sector 128~130)
 	// page1->index = 120, page2->index = 128
 
+	// sector & ( 8 - 1 ) --> 섹터 번호를 8로 나눈 나머지 --> 페이지 안의 섹터의 위치
+	// sector % 8 * 512 --> 페이지 안의 섹터 위치의 offset
 	target_offset = (sector & (8 - 1)) << 9;
+
+	// 복사할 범위 지정
 	// copy = copy data in a page
 	copy = min_t(size_t, len, PAGE_SIZE - target_offset);
 
+	// 요청된 섹터를 갖는 페이지 찾기.
 	dst_page = mybrd_lookup_page(mybrd, sector);
+	// 처음 write 가 발생한 섹터 --> 페이지 없음
 	if (!dst_page) {
+		// 트리에 페이지 추가
 		if (!mybrd_insert_page(mybrd, sector))
 			return -ENOSPC;
 
+		// 2개의 페이지에 걸친 데이터라면, 트리에 페이지 하나더 추가
 		if (copy < len) {
 			if (!mybrd_insert_page(mybrd, sector + (copy >> 9)))
 				return -ENOSPC;
@@ -159,10 +184,13 @@ static int copy_from_user_to_mybrd(struct mybrd_device *mybrd,
 		BUG_ON(!dst_page);
 	}
 
+	// src_page (커널이 전달한 페이지) 의 메모리 주소
 	src = kmap(src_page);
 	src += src_offset;
 
+	// dst_page (할당한 페이지) 의 메모리 주소
 	dst = kmap(dst_page);
+	// 페이지에 있는 데이터 복사
 	memcpy(dst + target_offset, src, copy);
 	kunmap(dst_page);
 
@@ -193,6 +221,7 @@ static int copy_from_user_to_mybrd(struct mybrd_device *mybrd,
 	return 0;
 }
 
+//램디스크의 데이터를 사용자에게 보내주는 함수
 static int copy_from_mybrd_to_user(struct mybrd_device *mybrd,
 				   struct page *dst_page,
 				   int len,
@@ -256,6 +285,8 @@ static blk_qc_t mybrd_make_request_fn(struct request_queue *q, struct bio *bio)
 
 	generic_start_io_acct(rw, bio_sectors(bio), &mybrd->mybrd_disk->part0);
 
+	//읽기 읽때는 copy_from_mybrd_to_user() 호출
+	//쓰기 일대는 copy_from_user_to_mybrd() 호출
 	bio_for_each_segment(bvec, bio, iter) {
 		unsigned int len = bvec.bv_len;
 		struct page *p = bvec.bv_page;
@@ -283,10 +314,15 @@ static blk_qc_t mybrd_make_request_fn(struct request_queue *q, struct bio *bio)
 
 			// userspace is going to read data that the kernel just wrote
 			// so flush-dcache is necessary
+			// 읽기 요청시, 드라이버가 가진 데이터를 사용자 페이지로 복사
+			// 사용자가 페이지에 접근할 때 메모리로부터 다시 캐시로 데이터가 전송되도록 만듬.
+			// 데이터 복사가 끝난 뒤, 캐시 무효화
 			flush_dcache_page(page);
 		} else if (rw == WRITE) {
 			// kernel is going to read data that userspace wrote,
 			// so flush-dcache is necessary
+			// 쓰기 요청시, 커널은 사용자 페이지 접근
+			// 커널이 페이지를 읽기 전에 캐시를 무효화
 			flush_dcache_page(page);
 			err = copy_from_user_to_mybrd(mybrd,
 						      p,
@@ -303,6 +339,8 @@ static blk_qc_t mybrd_make_request_fn(struct request_queue *q, struct bio *bio)
 		if (err)
 			goto io_error;
 
+		// 처리된 데이터 만큼 섹터 번호 증가 
+		// sector 번호 + (데이터 크기 / 512) 
 		sector = sector + (len >> 9);
 	}
 		
@@ -350,6 +388,7 @@ static struct mybrd_device *mybrd_alloc(void)
 		goto out;
 
 	spin_lock_init(&mybrd->mybrd_lock);
+	// radix_tree_root 구조체 초기화: radix tree의 root
 	INIT_RADIX_TREE(&mybrd->mybrd_pages, GFP_ATOMIC);
 	pr_warn("create mybrd:%p\n", mybrd);
 
