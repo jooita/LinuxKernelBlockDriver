@@ -58,6 +58,9 @@ static const struct block_device_operations mybrd_fops = {
 
 static blk_qc_t mybrd_make_request_fn(struct request_queue *q, struct bio *bio)
 {
+	// bio : I/O 기본 단위 --> request를 구성하며, bio_vec로 구성됨
+	// bio_vec : 최대 8 sector. segment를 나타냄. segment는 page를 가르킴.
+
 	struct block_device *bdev = bio->bi_bdev;
 	struct mybrd_device *mybrd = bdev->bd_disk->private_data;
 	int rw;
@@ -81,8 +84,11 @@ static blk_qc_t mybrd_make_request_fn(struct request_queue *q, struct bio *bio)
 		(int)sector, (int)end_sector, rw == READ ? "READ" : "WRITE");
 	pr_warn("bio-info: end-io=%p\n", bio->bi_end_io);
 
+	//disk 통계 정보 업데이트
 	generic_start_io_acct(rw, bio_sectors(bio), &mybrd->mybrd_disk->part0);
 
+	// bio에서 bio_vec(segment) 추출
+	// 실제로 디스크와 메모리 사이에서의 DMA transfer 수행.
 	bio_for_each_segment(bvec, bio, iter) {
 		unsigned int len = bvec.bv_len;
 		struct page *p = bvec.bv_page;
@@ -93,8 +99,10 @@ static blk_qc_t mybrd_make_request_fn(struct request_queue *q, struct bio *bio)
 
 	}
 		
+	// bio 객체 마무리
 	bio_endio(bio);
 
+	//disk 통계 정보 업데이트
 	generic_end_io_acct(rw, &mybrd->mybrd_disk->part0, start_time);
 	
 	pr_warn("end mybrd_make_request\n");
