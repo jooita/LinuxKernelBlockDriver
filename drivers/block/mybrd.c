@@ -1,7 +1,11 @@
 /*
  * Ram backed block device driver.
  *
- * Parts derived from drivers/block/rd.c, and drivers/block/loop.c
+ * Copyright (C) 2007 Nick Piggin
+ * Copyright (C) 2007 Novell Inc.
+ *
+ * Parts derived from drivers/block/rd.c, and drivers/block/loop.c, copyright
+ * of their respective owners.
  */
 
 #include <linux/init.h>
@@ -27,18 +31,291 @@
 MODULE_LICENSE("GPL");
 
 
-//mybrd 드라이버 관리 데이터
 struct mybrd_device {
 	struct request_queue *mybrd_queue;
 	struct gendisk *mybrd_disk;
-	//동기화
 	spinlock_t mybrd_lock;
+	struct radix_tree_root mybrd_pages;
 };
 
 
 static int mybrd_major;
 struct mybrd_device *global_mybrd;
 #define MYBRD_SIZE_4M 4*1024*1024
+
+
+static struct page *mybrd_lookup_page(struct mybrd_device *mybrd,
+				      sector_t sector)
+{
+	pgoff_t idx;
+	struct page *p;
+
+	rcu_read_lock();
+
+	idx = sector >> (PAGE_SHIFT - 9);
+	p = radix_tree_lookup(&mybrd->mybrd_pages, idx);
+
+	rcu_read_unlock();
+
+	pr_warn("lookup: page-%p index-%d sector-%d\n",
+		p, p ? (int)p->index : -1, (int)sector);
+	return p;
+}
+
+static struct page *mybrd_insert_page(struct mybrd_device *mybrd,
+				      sector_t sector)
+{
+	pgoff_t idx;
+	struct page *p;
+	gfp_t gfp_flags;
+
+	p = mybrd_lookup_page(mybrd, sector);
+	if (p)
+		return p;
+
+	// MUST use _NOIO
+	gfp_flags = GFP_NOIO | __GFP_ZERO;
+	p = alloc_page(gfp_flags);
+	if (!p)
+		return NULL;
+
+	if (radix_tree_preload(GFP_NOIO)) {
+		__free_page(p);
+		return NULL;
+	}
+
+	/*
+	 * According to radix tree API document,
+	 * radix_tree_lookup() requires rcu_read_lock(),
+	 * but user must ensure the sync of calls for radix_tree_insert().
+	 */
+	spin_lock(&mybrd->mybrd_lock);
+
+	idx = sector >> (PAGE_SHIFT - 9);
+	p->index = idx;
+
+	if (radix_tree_insert(&mybrd->mybrd_pages, idx, p)) {
+		__free_page(p);
+		p = radix_tree_lookup(&mybrd->mybrd_pages, idx);
+		pr_warn("failed to insert page: duplicated=%d\n",
+			(int)idx);
+	} else {
+		pr_warn("insert: page-%p index=%d sector-%d\n",
+			p, (int)idx, (int)sector);
+	}
+
+	spin_unlock(&mybrd->mybrd_lock);
+
+	radix_tree_preload_end();
+	
+	return p;
+}
+
+static void show_data(unsigned char *ptr)
+{
+	pr_warn("%x %x %x %x %x %x %x %x\n",
+		ptr[0], ptr[1], ptr[2], ptr[3],
+		ptr[4],	ptr[5],	ptr[6], ptr[7]);
+}
+
+static int copy_from_user_to_mybrd(struct mybrd_device *mybrd,
+			 struct page *src_page,
+			 int len,
+			 unsigned int src_offset,
+			 sector_t sector)
+{
+	struct page *dst_page;
+	void *dst;
+	unsigned int target_offset;
+	size_t copy;
+	void *src;
+
+	// sectors can be stored across two pages
+	// 8 = one page can have 8-sectors
+	// target_offset = sector * 512(sector-size) = target_offset in a page
+	// eg) sector = 123, size=4096
+	// page1 <- sector120 ~ sector127
+	// page2 <- sector128 ~ sector136
+	// store 512*5-bytes at page1 (sector 123~127)
+	// store 512*3-bytes at page2 (sector 128~130)
+	// page1->index = 120, page2->index = 128
+
+	target_offset = (sector & (8 - 1)) << 9;
+	// copy = copy data in a page
+	copy = min_t(size_t, len, PAGE_SIZE - target_offset);
+
+	dst_page = mybrd_lookup_page(mybrd, sector);
+	if (!dst_page) {
+		if (!mybrd_insert_page(mybrd, sector))
+			return -ENOSPC;
+
+		if (copy < len) {
+			if (!mybrd_insert_page(mybrd, sector + (copy >> 9)))
+				return -ENOSPC;
+		}
+
+		// now it cannot fail
+		dst_page = mybrd_lookup_page(mybrd, sector);
+		BUG_ON(!dst_page);
+	}
+
+	src = kmap(src_page);
+	src += src_offset;
+
+	dst = kmap(dst_page);
+	memcpy(dst + target_offset, src, copy);
+	kunmap(dst_page);
+
+	pr_warn("copy: %p <- %p (%d-bytes)\n", dst + target_offset, src, (int)copy);
+	show_data(dst+target_offset);
+	show_data(src);
+	
+	// copy next page
+	if (copy < len) {
+		src += copy;
+		sector += (copy >> 9);
+		copy = len - copy;
+		dst_page = mybrd_lookup_page(mybrd, sector);
+		BUG_ON(!dst_page);
+
+		dst = kmap(dst_page); // next page
+
+		// dst: copy data at the first address of the page
+		memcpy(dst, src, copy);
+		kunmap(dst_page);
+
+		pr_warn("copy: %p <- %p (%d-bytes)\n", dst + target_offset, src, (int)copy);
+		show_data(dst);
+		show_data(src);
+	}
+	kunmap(src_page);
+
+	return 0;
+}
+
+static int copy_from_mybrd_to_user(struct mybrd_device *mybrd,
+				   struct page *dst_page,
+				   int len,
+				   unsigned int dst_offset,
+				   sector_t sector)
+{
+	struct page *src_page;
+	void *src;
+	size_t copy;
+	void *dst;
+	unsigned int src_offset;
+
+	src_offset = (sector & 0x7) << 9;
+	copy = min_t(size_t, len, PAGE_SIZE - src_offset);
+
+	dst = kmap(dst_page);
+	dst += dst_offset;
+	
+	src_page = mybrd_lookup_page(mybrd, sector);
+	if (src_page) {
+		src = kmap_atomic(src_page);
+		src += src_offset;
+		memcpy(dst, src, copy);
+		kunmap_atomic(src);
+
+		pr_warn("copy: %p <- %p (%d-bytes)\n", dst, src, (int)copy);
+		show_data(dst);
+		show_data(src);
+	} else {
+		memset(dst, 0, copy);
+		pr_warn("copy: %p <- 0 (%d-bytes)\n", dst, (int)copy);
+		show_data(dst);
+	}
+
+	kunmap(dst_page);
+	return 0;
+}
+
+static blk_qc_t mybrd_make_request_fn(struct request_queue *q, struct bio *bio)
+{
+	struct block_device *bdev = bio->bi_bdev;
+	struct mybrd_device *mybrd = bdev->bd_disk->private_data;
+	int rw;
+	struct bio_vec bvec;
+	sector_t sector;
+	sector_t end_sector;
+	struct bvec_iter iter;
+	unsigned long start_time = jiffies;
+
+	pr_warn("start mybrd_make_request_fn: block_device=%p mybrd=%p\n",
+		bdev, mybrd);
+
+	//dump_stack();
+	
+	// print info of bio
+	sector = bio->bi_iter.bi_sector;
+	end_sector = bio_end_sector(bio);
+	rw = bio_rw(bio);
+	pr_warn("bio-info: sector=%d end_sector=%d rw=%s\n",
+		(int)sector, (int)end_sector, rw == READ ? "READ" : "WRITE");
+
+	generic_start_io_acct(rw, bio_sectors(bio), &mybrd->mybrd_disk->part0);
+
+	bio_for_each_segment(bvec, bio, iter) {
+		unsigned int len = bvec.bv_len;
+		struct page *p = bvec.bv_page;
+		unsigned int offset = bvec.bv_offset;
+		int err;
+
+		pr_warn("segment-info: len=%u p=%p offset=%u\n",
+			len, p, offset);
+
+		// The reason of flush-dcache
+		// https://patchwork.kernel.org/patch/2742
+		// You have to call fluch_dcache_page() in two situations,
+		// when the kernel is going to read some data that userspace wrote, *and*
+		// when userspace is going to read some data that the kernel wrote.
+		
+		if (rw == READ || rw == READA) {
+			// kernel write data from kernelspace into userspace
+			err = copy_from_mybrd_to_user(mybrd,
+						      p,
+						      len,
+						      offset,
+						      sector);
+			if (err)
+				goto io_error;
+
+			// userspace is going to read data that the kernel just wrote
+			// so flush-dcache is necessary
+			flush_dcache_page(page);
+		} else if (rw == WRITE) {
+			// kernel is going to read data that userspace wrote,
+			// so flush-dcache is necessary
+			flush_dcache_page(page);
+			err = copy_from_user_to_mybrd(mybrd,
+						      p,
+						      len,
+						      offset,
+						      sector);
+			if (err)
+				goto io_error;
+		} else {
+			pr_warn("rw is not READ/WRITE\n");
+			goto io_error;
+		}
+
+		if (err)
+			goto io_error;
+
+		sector = sector + (len >> 9);
+	}
+		
+	bio_endio(bio);
+
+	generic_end_io_acct(rw, &mybrd->mybrd_disk->part0, start_time);
+		
+	pr_warn("end mybrd_make_request_fn\n");
+	return BLK_QC_T_NONE;
+io_error:
+	bio_io_error(bio);
+	return BLK_QC_T_NONE;
+}
 
 
 static int mybrd_ioctl(struct block_device *bdev, fmode_t mode,
@@ -56,62 +333,6 @@ static const struct block_device_operations mybrd_fops = {
 	.ioctl =		mybrd_ioctl,
 };
 
-static blk_qc_t mybrd_make_request_fn(struct request_queue *q, struct bio *bio)
-{
-	// bio : I/O 기본 단위 --> request를 구성하며, bio_vec로 구성됨
-	// bio_vec : 최대 8 sector. segment를 나타냄. segment는 page를 가르킴.
-
-	struct block_device *bdev = bio->bi_bdev;
-	struct mybrd_device *mybrd = bdev->bd_disk->private_data;
-	int rw;
-	struct bio_vec bvec;
-	sector_t sector;
-	sector_t end_sector;
-	struct bvec_iter iter;
-	unsigned long start_time = jiffies;
-
-	pr_warn("start mybrd_make_request_fn: block_device=%p mybrd=%p\n",
-		bdev, mybrd);
-	//dump_stack();
-
-	if (mybrd != global_mybrd)
-		goto io_error;
-
-	sector = bio->bi_iter.bi_sector;
-	end_sector = bio_end_sector(bio);
-	rw = bio_rw(bio);
-	pr_warn("bio-info: sector=%d end_sector=%d rw=%s\n",
-		(int)sector, (int)end_sector, rw == READ ? "READ" : "WRITE");
-	pr_warn("bio-info: end-io=%p\n", bio->bi_end_io);
-
-	//disk 통계 정보 업데이트
-	generic_start_io_acct(rw, bio_sectors(bio), &mybrd->mybrd_disk->part0);
-
-	// bio에서 bio_vec(segment) 추출
-	// 실제로 디스크와 메모리 사이에서의 DMA transfer 수행.
-	bio_for_each_segment(bvec, bio, iter) {
-		unsigned int len = bvec.bv_len;
-		struct page *p = bvec.bv_page;
-		unsigned int offset = bvec.bv_offset;
-
-		pr_warn("segment-info: len=%u p=%p offset=%u\n",
-			len, p, offset);
-
-	}
-		
-	// bio 객체 마무리
-	bio_endio(bio);
-
-	//disk 통계 정보 업데이트
-	generic_end_io_acct(rw, &mybrd->mybrd_disk->part0, start_time);
-	
-	pr_warn("end mybrd_make_request\n");
-	// no cookie
-	return BLK_QC_T_NONE;
-io_error:
-	bio_io_error(bio);
-	return BLK_QC_T_NONE;
-}
 
 static struct mybrd_device *mybrd_alloc(void)
 {
@@ -129,6 +350,7 @@ static struct mybrd_device *mybrd_alloc(void)
 		goto out;
 
 	spin_lock_init(&mybrd->mybrd_lock);
+	INIT_RADIX_TREE(&mybrd->mybrd_pages, GFP_ATOMIC);
 	pr_warn("create mybrd:%p\n", mybrd);
 
 	/*
@@ -181,22 +403,19 @@ out:
 
 static void mybrd_free(struct mybrd_device *mybrd)
 {
-	blk_cleanup_queue(mybrd->mybrd_queue);
-	kfree(mybrd);
+	blk_cleanup_queue(global_mybrd->mybrd_queue);
+	kfree(global_mybrd);
 }
 
 static int __init mybrd_init(void)
 {
 	pr_warn("\n\n\nmybrd: module loaded\n\n\n\n");
 
-	//장치 번호 반환
 	mybrd_major = register_blkdev(mybrd_major, "my-ramdisk");
 	if (mybrd_major < 0)
 		return mybrd_major;
 
 	pr_warn("mybrd major=%d\n", mybrd_major);
-
-	//mybrd_device 객체(request_queue, gendisk) 생성
 	global_mybrd = mybrd_alloc();
 	if (!global_mybrd) {
 		pr_warn("failed to initialize mybrd\n");
@@ -218,4 +437,5 @@ static void __exit mybrd_exit(void)
 
 module_init(mybrd_init);
 module_exit(mybrd_exit);
+
 
