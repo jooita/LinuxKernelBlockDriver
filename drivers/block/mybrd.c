@@ -35,6 +35,11 @@ enum {
 	MYBRD_Q_RQ		= 1, // IO in request base
 };
 
+enum {
+	MYBRD_IRQ_NONE		= 0,
+	MYBRD_IRQ_SOFTIRQ	= 1,
+};
+
 struct mybrd_device {
 	struct request_queue *mybrd_queue;
 	struct gendisk *mybrd_disk;
@@ -45,6 +50,7 @@ struct mybrd_device {
 
 
 static int queue_mode = MYBRD_Q_RQ;
+static int irqmode = MYBRD_IRQ_SOFTIRQ;
 static int mybrd_major;
 struct mybrd_device *global_mybrd;
 #define MYBRD_SIZE_1M 4*1024*1024
@@ -345,7 +351,6 @@ static const struct block_device_operations mybrd_fops = {
 	.ioctl =		mybrd_ioctl,
 };
 
-//for request mode
 static int mybrd_prep_rq_fn(struct request_queue *q, struct request *req)
 {
 	struct mybrd_device *mybrd = q->queuedata;
@@ -366,7 +371,6 @@ static int mybrd_prep_rq_fn(struct request_queue *q, struct request *req)
 	return BLKPREP_OK;
 }
 
-//for request mode
 static int _mybrd_request_fn(struct request *req)
 {
 	struct bio_vec bvec;
@@ -383,8 +387,10 @@ static int _mybrd_request_fn(struct request *req)
 		goto io_error;
 	}
 	
+	//request에서 처리해야할 첫번째 섹터 번호 반환
 	sector = blk_rq_pos(req); // initial sector
 
+	//request에서 segment를 하나씩 가져와 처리
 	rq_for_each_segment(bvec, req, iter) {
 		len = bvec.bv_len;
 		p = bvec.bv_page;
@@ -424,15 +430,28 @@ io_error:
 	return -EIO;
 }
 
-//for request mode
+//for softIRQ
+// request의 queuelist를 초기화하여 queue로부터 request 분리
+static void mybrd_softirq_done_fn(struct request *req)
+{
+	int err;
+	pr_warn("start softirq_done_fn: complete delayed request: %p", req);
+	list_del_init(&req->queuelist);
+	// 하나의 request 처리
+	err = _mybrd_request_fn(req);
+	blk_end_request_all(req, err);
+	pr_warn("end softirq_done_fn\n");
+}
+
 static void mybrd_request_fn(struct request_queue *q)
 {
 	struct request *req;
 	int err = 0;
 
-	pr_warn("start request_fn: q=%p\n", q);
+	pr_warn("start request_fn: q=%p irqmode=%d\n", q, irqmode);
 	//dump_stack();
 
+	//request queue에서 하나의 request를 가져옴
 	while ((req = blk_fetch_request(q)) != NULL) {
 		spin_unlock_irq(q->queue_lock);
 
@@ -440,8 +459,23 @@ static void mybrd_request_fn(struct request_queue *q)
 			req, (int)blk_rq_bytes(req),
 			rq_data_dir(req) ? "WRITE":"READ");
 		
-		err = _mybrd_request_fn(req);
-		blk_end_request_all(req, err); // finish the request
+		switch (irqmode) {
+		case MYBRD_IRQ_NONE:
+			err = _mybrd_request_fn(req);
+			//request 처리의 끝을 커널에게 알림
+			blk_end_request_all(req, err);
+			break;
+
+		//for softIRQ
+		case MYBRD_IRQ_SOFTIRQ:
+			// pass request into per-cpu list blk_cpu_done
+			// softirq_done_fn will be called for each request
+			//
+			// blk_cpu_done : per-cpu 리스트, BLOCK_SOFTIRQ 등록
+			// 해당 request를 blk_cpu_done 리스트에 추가
+			blk_complete_request(req);
+			break;
+		}
 
 		spin_lock_irq(q->queue_lock);
 	}
@@ -468,14 +502,14 @@ static struct mybrd_device *mybrd_alloc(void)
 	INIT_RADIX_TREE(&mybrd->mybrd_pages, GFP_ATOMIC);
 
 	if (queue_mode == MYBRD_Q_BIO) {
+		//bio 단위로 IO 정보를 전달하는 queue 생성
 		rq = mybrd->mybrd_queue = blk_alloc_queue_node(GFP_KERNEL,
 							       NUMA_NO_NODE);
 		if (!mybrd->mybrd_queue)
 			goto out_free_brd;
 		blk_queue_make_request(mybrd->mybrd_queue, mybrd_make_request_fn);
-
-	//request mode
 	} else if (queue_mode == MYBRD_Q_RQ) {
+		//request 단위로 IO 정보를 전달하는 IO scheduler를 포함한 queue 생성
 		rq = mybrd->mybrd_queue = blk_init_queue_node(mybrd_request_fn,
 							      &mybrd->mybrd_queue_lock,
 							      NUMA_NO_NODE);
@@ -484,7 +518,12 @@ static struct mybrd_device *mybrd_alloc(void)
 			goto out_free_brd;
 		}
 		blk_queue_prep_rq(mybrd->mybrd_queue, mybrd_prep_rq_fn);
-		//blk_queue_softirq_done(mybrd->mybrd_queue, mybrd_softirq_done_fn);
+
+
+		//for softIRQ
+		if (irqmode == MYBRD_IRQ_SOFTIRQ)
+			blk_queue_softirq_done(mybrd->mybrd_queue,
+					       mybrd_softirq_done_fn);
 	}
 	pr_warn("create queue: mybrd-%p queue-mode-%d rq=%p\n",
 		mybrd, queue_mode, rq);
